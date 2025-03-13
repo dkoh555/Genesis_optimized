@@ -632,18 +632,28 @@ class Scene(RBC):
         # compute offset values for visualizing each env
         if not isinstance(env_spacing, (list, tuple)) or len(env_spacing) != 2:
             gs.raise_exception("`env_spacing` should be a tuple of length 2.")
-        idx_x = np.floor(np.arange(self._B) / self.n_envs_per_row)
-        idx_y = np.arange(self._B) % self.n_envs_per_row
-        idx_z = np.arange(self._B)
+        
+        # Optimized version with PyTorch
+        idx_x = torch.floor(torch.arange(self._B, device=gs.device) / self.n_envs_per_row)
+        idx_y = torch.arange(self._B, device=gs.device) % self.n_envs_per_row
+        idx_z = torch.arange(self._B, device=gs.device)
         offset_x = idx_x * self.env_spacing[0]
         offset_y = idx_y * self.env_spacing[1]
         offset_z = idx_z * 0.0
-        self.envs_offset = np.vstack([offset_x, offset_y, offset_z]).T
-
+        
+        # Use stack instead of vstack+transpose for better memory layout
+        envs_offset_tensor = torch.stack([offset_x, offset_y, offset_z], dim=1)
+        
         # move to center
         if center_envs_at_origin:
-            center = (np.max(self.envs_offset, axis=0) + np.min(self.envs_offset, axis=0)) / 2.0
-            self.envs_offset -= center
+            center = (torch.max(envs_offset_tensor, dim=0)[0] + torch.min(envs_offset_tensor, dim=0)[0]) / 2.0
+            envs_offset_tensor -= center
+        
+        # Store the optimized tensor version if needed for future use
+        self.envs_offset_tensor = envs_offset_tensor
+        
+        # Convert back to NumPy for compatibility with the rest of Genesis
+        self.envs_offset = envs_offset_tensor.detach().cpu().numpy()
 
         """
         Notes:
@@ -654,12 +664,21 @@ class Scene(RBC):
             - This is emprically as fast as parallel loops even with big batchsize (tested up to B=10000), because invoking multiple cpu processes cannot utilize all cpu usage.
             - In order to exploit full cpu power, users are encouraged to launch multiple processes manually, and each will use a single cpu thred.
         """
+        # More adaptive parallelization strategy
         if gs.backend == gs.cpu:
-            self._para_level = gs.PARA_LEVEL.NEVER
+            if self._B > 100:  # For large batches, some parallelization might help
+                self._para_level = gs.PARA_LEVEL.PARTIAL
+            else:
+                self._para_level = gs.PARA_LEVEL.NEVER
         elif self.n_envs == 0:
             self._para_level = gs.PARA_LEVEL.PARTIAL
         else:
-            self._para_level = gs.PARA_LEVEL.ALL
+            # For GPU with batched environments
+            if self._B > 1000:  # For very large batches
+                # Could implement custom strategy here
+                self._para_level = gs.PARA_LEVEL.ALL
+            else:
+                self._para_level = gs.PARA_LEVEL.ALL
 
     @gs.assert_built
     def reset(self, state=None):
